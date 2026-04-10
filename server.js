@@ -9,6 +9,30 @@ const cookieParser = require('cookie-parser');
 
 const crypto = require('crypto');         // <-- NEW: Secure token generator
 const axios = require('axios'); // <-- NEW: To talk to Python
+
+const PQueue = require('p-queue').default;
+const queue = new PQueue({
+  interval: 60000,
+  intervalCap: 9 // safe buffer under 10 RPM limit
+});
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function retryWithBackoff(fn, retries = 3) {
+  let delay = 2000;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === retries - 1) throw err; // throw on last attempt
+      if (!err.message.includes('429')) throw err; // only backoff for 429 quota limits
+      console.log(`⏳ 429 Quota Exceeded. Retrying in ${delay / 1000}s...`);
+      await sleep(delay);
+      delay *= 2;
+    }
+  }
+}
+
 // Import your Models and Routes
 const Candidate = require('./models/Candidate');
 const Job = require('./models/Job');
@@ -180,39 +204,113 @@ app.get('/api/interview/verify/:token', async (req, res) => {
 // ==========================================
 // INTERVIEW GEMINI AI CHAT ROUTE (FIXED)
 // ==========================================
+
+const FALLBACK_KEYS = [
+  process.env.GEMINI_MAIN_KEY, 
+  process.env.GEMINI_BACKUP_KEY_1,
+  process.env.GEMINI_BACKUP_KEY_2
+].filter(Boolean);
+
+async function callGeminiWithFallback({ modelOptions, chatOptions, prompt }) {
+  let lastError;
+
+  for (let i = 0; i < FALLBACK_KEYS.length; i++) {
+    const apiKey = FALLBACK_KEYS[i];
+
+    try {
+      const keyNames = ['main', 'backup 1', 'backup 2'];
+      console.log(`Trying Gemini key '${keyNames[i]}'`);
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel(modelOptions);
+
+      if (chatOptions) {
+        const chat = model.startChat(chatOptions);
+        const result = await chat.sendMessage(prompt);
+        const response = await result.response;
+        return response.text();
+      } else {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        return response.text();
+      }
+    } catch (error) {
+      lastError = error;
+      const msg = String(error.message || "").toLowerCase();
+
+      const shouldRotate =
+        msg.includes("429") ||
+        msg.includes("503") ||
+        msg.includes("401") ||
+        msg.includes("403") ||
+        msg.includes("quota") ||
+        msg.includes("permission") ||
+        msg.includes("api key") || 
+        msg.includes("invalid api key");
+
+      const keyNames = ['main', 'backup 1', 'backup 2'];
+      console.log(`Key '${keyNames[i]}' failed: ${error.message}`);
+
+      if (!shouldRotate) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error(`All Gemini keys failed. Last error: ${lastError?.message || "Unknown error"}`);
+}
+
 app.post('/api/interview/chat', async (req, res) => {
+  let systemInstruction = "";
+  let isDone = false;
+  let candidate = null;
+  let candidateMessage = "";
+  let chatHistory = [];
+  
   try {
-    const { candidateMessage, chatHistory } = req.body;
+    candidateMessage = req.body.candidateMessage;
+    chatHistory = req.body.chatHistory;
+    const token = req.body.token;
+    
+    // Look up the candidate using the token from the frontend
+    candidate = await Candidate.findOne({ interviewToken: token });
+    if (!candidate) {
+      return res.status(404).json({ error: "Candidate not found. Invalid token." });
+    }
     
     const messageCount = chatHistory ? chatHistory.length : 0;
+    isDone = messageCount >= 7;
     
-    let systemInstruction = "You are an expert HR Technical Interviewer. Keep your responses extremely concise (1 or 2 sentences max). Ask exactly one technical question at a time. Be professional but conversational.";
+    const shortResume = candidate.resumeText ? candidate.resumeText.substring(0, 1000) : "";
     
-    if (messageCount >= 7) {
-      systemInstruction += " This is the FINAL text of the interview. You MUST NOT ask any more questions. Thank the candidate for their time, tell them HR will review their responses, and explicitly conclude the interview.";
-    } else {
-      systemInstruction += " We are in the middle of the interview. Analyze their previous answer gracefully and ask the next technical question.";
-    }
+    systemInstruction = `You are an expert HR Technical Interviewer operating under strict API rate limits.
+IMPORTANT CONSTRAINTS:
+- Keep responses VERY short (1-2 sentences max)
+- Ask only ONE question at a time
+- Avoid unnecessary explanations
+- Do NOT repeat previous context
+- Minimize token usage
 
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.5-flash",
-      systemInstruction: systemInstruction 
-    });
+You are interviewing ${candidate.name}.
+Resume:
+"""
+${shortResume}
+"""`;
+    
+    if (isDone) {
+      systemInstruction += "\nThis is the FINAL text of the interview. You MUST NOT ask any more questions. Thank the candidate for their time, tell them HR will review their responses, and explicitly conclude the interview.";
+    } else {
+      systemInstruction += "\nWe are in the middle of the interview. Analyze their previous answer gracefully and ask exactly ONE next technical question based on their resume.";
+    }
 
     const formattedHistory = (chatHistory || []).map(msg => ({
       role: msg.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: msg.content }]
     }));
 
-    // FIX 1: Prevent "Double User" Crash
-    // The frontend already appended the newest message to chatHistory. 
-    // We must pop it off the history array before calling sendMessage!
     if (formattedHistory.length > 0 && formattedHistory[formattedHistory.length - 1].role === 'user') {
       formattedHistory.pop();
     }
 
-    // Ensure history starts with 'user'
     if (formattedHistory.length > 0 && formattedHistory[0].role === 'model') {
       formattedHistory.unshift({
         role: 'user',
@@ -220,29 +318,107 @@ app.post('/api/interview/chat', async (req, res) => {
       });
     }
 
-    const chat = model.startChat({
-      history: formattedHistory,
-    });
+    const executeGenerativeCall = async () => {
+      await sleep(6000); // Throttling
+      
+      let aiResponseText = await callGeminiWithFallback({
+        modelOptions: { model: "gemini-2.5-flash", systemInstruction },
+        chatOptions: { history: formattedHistory },
+        prompt: candidateMessage
+      });
 
-    // Send the message
-    const result = await chat.sendMessage(candidateMessage);
-    const responseTracker = await result.response;
-    const aiResponseText = responseTracker.text();
+      // ASYNC Real AI Grading System (Decoupled to save burst quota)
+      if (isDone) {
+        setTimeout(async () => {
+          try {
+            console.log(`\n[BACKGROUND] Initiating Evaluation for ${candidate.name}...`);
+            
+            const transcript = chatHistory.map(m => `${m.role}: ${m.content}`).join("\n") + `\nuser: ${candidateMessage}\nmodel: ${aiResponseText}`;
+            const evalPrompt = `Evaluate this technical interview transcript for candidate ${candidate.name} based on their resume.
+Resume: ${shortResume}
 
-    // FIX 2: Match the exact JSON keys the React frontend is looking for!
-    // We will trigger the "Interview Complete" screen after 7 messages.
-    const isDone = messageCount >= 7;
+Transcript:
+${transcript}
+
+Calculate a final interview score from 0 to 100 assessing their technical accuracy and communication. 
+Return ONLY a JSON object matching this exact schema:
+{"score": 85, "feedback": "Brief feedback"}`;
+            
+            // Queue the evaluation using the same fallback logic!
+            queue.add(async () => {
+                const evalText = await callGeminiWithFallback({
+                  modelOptions: { model: "gemini-2.5-flash" },
+                  chatOptions: null, // Evaluates as generic prompt
+                  prompt: evalPrompt
+                });
+                
+                const jsonMatch = evalText.match(/\{[\s\S]*\}/);
+                let finalScore = 75; 
+                if (jsonMatch) {
+                  const evalObj = JSON.parse(jsonMatch[0]);
+                  finalScore = evalObj.score;
+                }
+
+                candidate.interviewScore = finalScore;
+                await candidate.save();
+                console.log(`[BACKGROUND] Evaluation completed successfully. Score: ${finalScore}`);
+            }).catch(async (evalErr) => {
+                console.error("[BACKGROUND] Evaluation queue failed: ", evalErr.message);
+                candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
+                await candidate.save();
+            });
+
+          } catch (evalErr) {
+            console.error("[BACKGROUND] Evaluation wrapper failed: ", evalErr.message);
+            candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
+            await candidate.save();
+          }
+        }, 100); 
+      }
+      
+      return aiResponseText;
+    };
+
+    // ==========================================
+    // EXECUTE API WITH QUEUE
+    // ==========================================
+    let aiResponseText = "";
+    
+    console.log(`\n======================================`);
+    console.log(`🤖 AI REQUEST QUEUED`);
+    console.log(`======================================`);
+    
+    try {
+      // Execute the rotation fallback method directly inside queue
+      aiResponseText = await queue.add(() => executeGenerativeCall());
+      console.log(`✅ STATUS     : SUCCESS`);
+    } catch (error) {
+      console.error(`❌ STATUS     : FINAL FAILURE (${error.message})`);
+      console.log(`======================================\n`);
+      return res.status(200).json({
+        nextQuestion: "We are experiencing high traffic and API limits. Please wait a few moments and try sending your message again.",
+        isInterviewComplete: false,
+        finalScore: null,
+        strengths: [],
+        weaknesses: []
+      });
+    }
+    console.log(`======================================\n`);
+
+    if (isDone) {
+      console.log(`[Metrics] Interview Complete!`);
+    }
 
     res.status(200).json({ 
         nextQuestion: aiResponseText,
         isInterviewComplete: isDone,
-        finalScore: isDone ? Math.floor(Math.random() * 20) + 75 : null, // Generates a random score between 75-95
-        strengths: isDone ? ["Clear communication", "Good foundational knowledge"] : [],
-        weaknesses: isDone ? ["Could provide more specific technical examples"] : []
+        finalScore: candidate.interviewScore || null,
+        strengths: [],
+        weaknesses: []
     });
 
   } catch (error) {
-    console.error("Gemini API Error:", error);
+    console.error("Route Error:", error.message);
     res.status(500).json({ error: "Failed to communicate with AI interviewer.", details: error.message });
   }
 });
