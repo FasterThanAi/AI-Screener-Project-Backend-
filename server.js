@@ -202,24 +202,23 @@ app.get('/api/interview/verify/:token', async (req, res) => {
 });
 
 // ==========================================
+// ==========================================
 // INTERVIEW GEMINI AI CHAT ROUTE (FIXED)
 // ==========================================
 
-const FALLBACK_KEYS = [
-  process.env.GEMINI_MAIN_KEY, 
-  process.env.GEMINI_BACKUP_KEY_1,
-  process.env.GEMINI_BACKUP_KEY_2
-].filter(Boolean);
+const responseCache = new Map(); // Global in-memory cache for repeated answers
 
-async function callGeminiWithFallback({ modelOptions, chatOptions, prompt }) {
+async function callGeminiWithModelFallback({ modelOptionsArray, chatOptions, prompt }) {
   let lastError;
+  const apiKey = process.env.GEMINI_MAIN_KEY; // Only ONE API key
 
-  for (let i = 0; i < FALLBACK_KEYS.length; i++) {
-    const apiKey = FALLBACK_KEYS[i];
+  if (!apiKey) throw new Error("GEMINI_MAIN_KEY is not configured.");
+
+  for (let i = 0; i < modelOptionsArray.length; i++) {
+    const modelOptions = modelOptionsArray[i];
 
     try {
-      const keyNames = ['main', 'backup 1', 'backup 2'];
-      console.log(`Trying Gemini key '${keyNames[i]}'`);
+      console.log(`\n🤖 Trying Gemini model: '${modelOptions.model}'`);
       const genAI = new GoogleGenerativeAI(apiKey);
       const model = genAI.getGenerativeModel(modelOptions);
 
@@ -237,18 +236,13 @@ async function callGeminiWithFallback({ modelOptions, chatOptions, prompt }) {
       lastError = error;
       const msg = String(error.message || "").toLowerCase();
 
+      // Rotate models only for rate limits or demand spikes, NOT invalid keys/auth issues
       const shouldRotate =
         msg.includes("429") ||
         msg.includes("503") ||
-        msg.includes("401") ||
-        msg.includes("403") ||
-        msg.includes("quota") ||
-        msg.includes("permission") ||
-        msg.includes("api key") || 
-        msg.includes("invalid api key");
+        msg.includes("quota");
 
-      const keyNames = ['main', 'backup 1', 'backup 2'];
-      console.log(`Key '${keyNames[i]}' failed: ${error.message}`);
+      console.log(`❌ Model '${modelOptions.model}' failed: ${error.message}`);
 
       if (!shouldRotate) {
         throw error;
@@ -256,7 +250,7 @@ async function callGeminiWithFallback({ modelOptions, chatOptions, prompt }) {
     }
   }
 
-  throw new Error(`All Gemini keys failed. Last error: ${lastError?.message || "Unknown error"}`);
+  throw new Error(`All fallback models exhausted. Last error: ${lastError?.message || "Unknown error"}`);
 }
 
 app.post('/api/interview/chat', async (req, res) => {
@@ -319,10 +313,16 @@ ${shortResume}
     }
 
     const executeGenerativeCall = async () => {
-      await sleep(6000); // Throttling
+      await sleep(5000); // Throttling (under 9 intervalCap)
       
-      let aiResponseText = await callGeminiWithFallback({
-        modelOptions: { model: "gemini-2.5-flash", systemInstruction },
+      const chatModels = [
+        { model: "gemini-2.5-flash", systemInstruction },
+        { model: "gemini-2.5-flash-lite", systemInstruction }, // fallback 1
+        { model: "gemini-1.5-flash", systemInstruction } // final backup
+      ];
+
+      let aiResponseText = await callGeminiWithModelFallback({
+        modelOptionsArray: chatModels,
         chatOptions: { history: formattedHistory },
         prompt: candidateMessage
       });
@@ -344,11 +344,17 @@ Calculate a final interview score from 0 to 100 assessing their technical accura
 Return ONLY a JSON object matching this exact schema:
 {"score": 85, "feedback": "Brief feedback"}`;
             
-            // Queue the evaluation using the same fallback logic!
+            const evalModels = [
+              { model: "gemini-2.5-pro" },   // try pro first for heavy reasoning
+              { model: "gemini-2.5-flash" }, // fallback directly to flash
+              { model: "gemini-2.5-flash-lite" } // final emergency backup
+            ];
+
+            // Queue the evaluation using the model fallback logic!
             queue.add(async () => {
-                const evalText = await callGeminiWithFallback({
-                  modelOptions: { model: "gemini-2.5-flash" },
-                  chatOptions: null, // Evaluates as generic prompt
+                const evalText = await callGeminiWithModelFallback({
+                  modelOptionsArray: evalModels,
+                  chatOptions: null, 
                   prompt: evalPrompt
                 });
                 
@@ -389,9 +395,26 @@ Return ONLY a JSON object matching this exact schema:
     console.log(`======================================`);
     
     try {
-      // Execute the rotation fallback method directly inside queue
-      aiResponseText = await queue.add(() => executeGenerativeCall());
-      console.log(`✅ STATUS     : SUCCESS`);
+      const cacheKey = JSON.stringify(formattedHistory) + "|" + candidateMessage;
+      
+      if (responseCache.has(cacheKey)) {
+        console.log(`✅ STATUS     : SUCCESS (Served from Cache)`);
+        aiResponseText = responseCache.get(cacheKey);
+      } else {
+        // Execute the rotation fallback method directly inside queue
+        aiResponseText = await queue.add(() => executeGenerativeCall());
+        
+        // Save to cache
+        responseCache.set(cacheKey, aiResponseText);
+        
+        // Prevent immense memory leaks by limiting cache size
+        if (responseCache.size > 200) {
+          const firstKey = responseCache.keys().next().value;
+          responseCache.delete(firstKey);
+        }
+        
+        console.log(`✅ STATUS     : SUCCESS`);
+      }
     } catch (error) {
       console.error(`❌ STATUS     : FINAL FAILURE (${error.message})`);
       console.log(`======================================\n`);
