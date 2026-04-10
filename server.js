@@ -254,87 +254,91 @@ async function callGeminiWithModelFallback({ modelOptionsArray, chatOptions, pro
 }
 
 app.post('/api/interview/chat', async (req, res) => {
-  let systemInstruction = "";
-  let isDone = false;
-  let candidate = null;
-  let candidateMessage = "";
-  let chatHistory = [];
-  
   try {
-    candidateMessage = req.body.candidateMessage;
-    chatHistory = req.body.chatHistory;
+    const candidateMessage = req.body.candidateMessage;
+    const chatHistory = req.body.chatHistory;
     const token = req.body.token;
     
     // Look up the candidate using the token from the frontend
-    candidate = await Candidate.findOne({ interviewToken: token });
+    let candidate = await Candidate.findOne({ interviewToken: token });
     if (!candidate) {
       return res.status(404).json({ error: "Candidate not found. Invalid token." });
     }
     
-    const messageCount = chatHistory ? chatHistory.length : 0;
-    isDone = messageCount >= 7;
-    
     const shortResume = candidate.resumeText ? candidate.resumeText.substring(0, 1000) : "";
     
-    systemInstruction = `You are an expert HR Technical Interviewer operating under strict API rate limits.
-IMPORTANT CONSTRAINTS:
-- Keep responses VERY short (1-2 sentences max)
-- Ask only ONE question at a time
-- Avoid unnecessary explanations
-- Do NOT repeat previous context
-- Minimize token usage
-
-You are interviewing ${candidate.name}.
-Resume:
-"""
-${shortResume}
-"""`;
-    
-    if (isDone) {
-      systemInstruction += "\nThis is the FINAL text of the interview. You MUST NOT ask any more questions. Thank the candidate for their time, tell them HR will review their responses, and explicitly conclude the interview.";
-    } else {
-      systemInstruction += "\nWe are in the middle of the interview. Analyze their previous answer gracefully and ask exactly ONE next technical question based on their resume.";
-    }
-
-    const formattedHistory = (chatHistory || []).map(msg => ({
-      role: msg.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: msg.content }]
-    }));
-
-    if (formattedHistory.length > 0 && formattedHistory[formattedHistory.length - 1].role === 'user') {
-      formattedHistory.pop();
-    }
-
-    if (formattedHistory.length > 0 && formattedHistory[0].role === 'model') {
-      formattedHistory.unshift({
-        role: 'user',
-        parts: [{ text: "Hello. I am ready to begin the technical interview." }]
-      });
-    }
-
-    const executeGenerativeCall = async () => {
-      await sleep(5000); // Throttling (under 9 intervalCap)
+    // ==========================================
+    // STAGE 1: Pre-Generate Questions (Call 1)
+    // ==========================================
+    if (!candidate.preGeneratedQuestions || candidate.preGeneratedQuestions.length === 0) {
+      console.log(`\n======================================`);
+      console.log(`🤖 INITIALIZING PRE-GENERATION FOR ${candidate.name}`);
+      console.log(`======================================`);
       
-      const chatModels = [
-        { model: "gemini-2.5-flash", systemInstruction },
-        { model: "gemini-2.5-flash-lite", systemInstruction }, // fallback 1
-        { model: "gemini-1.5-flash", systemInstruction } // final backup
+      const generationPrompt = `You are an expert HR Technical Interviewer. 
+Based on this resume, generate exactly 5 personalized, highly technical interview questions to ask the candidate.
+Return ONLY a valid JSON array of 5 strings and nothing else.
+Example: ["Q1", "Q2", "Q3", "Q4", "Q5"]
+
+Resume:
+${shortResume}`;
+
+      const generateModels = [
+        { model: "gemini-2.5-flash" },
+        { model: "gemini-2.5-flash-lite" },
+        { model: "gemini-1.5-flash" }
       ];
 
-      let aiResponseText = await callGeminiWithModelFallback({
-        modelOptionsArray: chatModels,
-        chatOptions: { history: formattedHistory },
-        prompt: candidateMessage
-      });
+      try {
+        let generatedText = await queue.add(() => callGeminiWithModelFallback({
+          modelOptionsArray: generateModels,
+          chatOptions: null,
+          prompt: generationPrompt
+        }));
 
-      // ASYNC Real AI Grading System (Decoupled to save burst quota)
-      if (isDone) {
-        setTimeout(async () => {
-          try {
-            console.log(`\n[BACKGROUND] Initiating Evaluation for ${candidate.name}...`);
-            
-            const transcript = chatHistory.map(m => `${m.role}: ${m.content}`).join("\n") + `\nuser: ${candidateMessage}\nmodel: ${aiResponseText}`;
-            const evalPrompt = `Evaluate this technical interview transcript for candidate ${candidate.name} based on their resume.
+        let questions = [];
+        const jsonMatch = generatedText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          questions = JSON.parse(jsonMatch[0]);
+        }
+        
+        // Fallback if parsing fails
+        if (!questions || questions.length < 5) throw new Error("JSON generation failed");
+        
+        candidate.preGeneratedQuestions = questions;
+      } catch (err) {
+        console.error("Failed to generate questions:", err.message);
+        candidate.preGeneratedQuestions = [
+          "Can you describe your technical background?", 
+          "What is the most complex bug you've recently solved?", 
+          "How do you ensure code quality in your projects?", 
+          "Can you explain a time you had to learn a new technology quickly?", 
+          "Where do you see your technical skills growing in the next year?"
+        ];
+      }
+      
+      candidate.currentQuestionIndex = 0;
+      await candidate.save();
+    }
+
+    // ==========================================
+    // STAGE 2: Sequentially Serve Questions
+    // ==========================================
+    const isDone = candidate.currentQuestionIndex >= candidate.preGeneratedQuestions.length;
+    let aiResponseText = "";
+
+    if (isDone) {
+      aiResponseText = "This concludes the technical portion of our interview. Thank you for your time, the HR team will review your responses and explicitly reach out to you shortly.";
+      
+      // ==========================================
+      // STAGE 3: Final Background Evaluation (Call 2)
+      // ==========================================
+      setTimeout(async () => {
+        try {
+          console.log(`\n[BACKGROUND] Initiating Evaluation for ${candidate.name}...`);
+          
+          const transcript = chatHistory.map(m => `${m.role}: ${m.content}`).join("\n") + `\nuser: ${candidateMessage}\nmodel: ${aiResponseText}`;
+          const evalPrompt = `Evaluate this technical interview transcript for candidate ${candidate.name} based on their resume.
 Resume: ${shortResume}
 
 Transcript:
@@ -343,90 +347,49 @@ ${transcript}
 Calculate a final interview score from 0 to 100 assessing their technical accuracy and communication. 
 Return ONLY a JSON object matching this exact schema:
 {"score": 85, "feedback": "Brief feedback"}`;
-            
-            const evalModels = [
-              { model: "gemini-2.5-pro" },   // try pro first for heavy reasoning
-              { model: "gemini-2.5-flash" }, // fallback directly to flash
-              { model: "gemini-2.5-flash-lite" } // final emergency backup
-            ];
+          
+          const evalModels = [
+            { model: "gemini-2.5-pro" },
+            { model: "gemini-2.5-flash" },
+            { model: "gemini-2.5-flash-lite" }
+          ];
 
-            // Queue the evaluation using the model fallback logic!
-            queue.add(async () => {
-                const evalText = await callGeminiWithModelFallback({
-                  modelOptionsArray: evalModels,
-                  chatOptions: null, 
-                  prompt: evalPrompt
-                });
-                
-                const jsonMatch = evalText.match(/\{[\s\S]*\}/);
-                let finalScore = 75; 
-                if (jsonMatch) {
-                  const evalObj = JSON.parse(jsonMatch[0]);
-                  finalScore = evalObj.score;
-                }
+          queue.add(async () => {
+              const evalText = await callGeminiWithModelFallback({
+                modelOptionsArray: evalModels,
+                chatOptions: null, 
+                prompt: evalPrompt
+              });
+              
+              const jsonMatch = evalText.match(/\{[\s\S]*\}/);
+              let finalScore = 75; 
+              if (jsonMatch) {
+                const evalObj = JSON.parse(jsonMatch[0]);
+                finalScore = evalObj.score;
+              }
 
-                candidate.interviewScore = finalScore;
-                await candidate.save();
-                console.log(`[BACKGROUND] Evaluation completed successfully. Score: ${finalScore}`);
-            }).catch(async (evalErr) => {
-                console.error("[BACKGROUND] Evaluation queue failed: ", evalErr.message);
-                candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
-                await candidate.save();
-            });
+              candidate.interviewScore = finalScore;
+              await candidate.save();
+              console.log(`[BACKGROUND] Evaluation completed successfully. Score: ${finalScore}`);
+          }).catch(async (evalErr) => {
+              console.error("[BACKGROUND] Evaluation queue failed: ", evalErr.message);
+              candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
+              await candidate.save();
+          });
 
-          } catch (evalErr) {
-            console.error("[BACKGROUND] Evaluation wrapper failed: ", evalErr.message);
-            candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
-            await candidate.save();
-          }
-        }, 100); 
-      }
-      
-      return aiResponseText;
-    };
-
-    // ==========================================
-    // EXECUTE API WITH QUEUE
-    // ==========================================
-    let aiResponseText = "";
-    
-    console.log(`\n======================================`);
-    console.log(`🤖 AI REQUEST QUEUED`);
-    console.log(`======================================`);
-    
-    try {
-      const cacheKey = JSON.stringify(formattedHistory) + "|" + candidateMessage;
-      
-      if (responseCache.has(cacheKey)) {
-        console.log(`✅ STATUS     : SUCCESS (Served from Cache)`);
-        aiResponseText = responseCache.get(cacheKey);
-      } else {
-        // Execute the rotation fallback method directly inside queue
-        aiResponseText = await queue.add(() => executeGenerativeCall());
-        
-        // Save to cache
-        responseCache.set(cacheKey, aiResponseText);
-        
-        // Prevent immense memory leaks by limiting cache size
-        if (responseCache.size > 200) {
-          const firstKey = responseCache.keys().next().value;
-          responseCache.delete(firstKey);
+        } catch (evalErr) {
+          console.error("[BACKGROUND] Evaluation wrapper failed: ", evalErr.message);
+          candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
+          await candidate.save();
         }
-        
-        console.log(`✅ STATUS     : SUCCESS`);
-      }
-    } catch (error) {
-      console.error(`❌ STATUS     : FINAL FAILURE (${error.message})`);
-      console.log(`======================================\n`);
-      return res.status(200).json({
-        nextQuestion: "We are experiencing high traffic and API limits. Please wait a few moments and try sending your message again.",
-        isInterviewComplete: false,
-        finalScore: null,
-        strengths: [],
-        weaknesses: []
-      });
+      }, 100);
+
+    } else {
+      console.log(`✅ Served question ${candidate.currentQuestionIndex + 1} from MongoDB Cache instantly!`);
+      aiResponseText = candidate.preGeneratedQuestions[candidate.currentQuestionIndex];
+      candidate.currentQuestionIndex += 1;
+      await candidate.save();
     }
-    console.log(`======================================\n`);
 
     if (isDone) {
       console.log(`[Metrics] Interview Complete!`);
@@ -442,7 +405,7 @@ Return ONLY a JSON object matching this exact schema:
 
   } catch (error) {
     console.error("Route Error:", error.message);
-    res.status(500).json({ error: "Failed to communicate with AI interviewer.", details: error.message });
+    res.status(500).json({ error: "Failed to process interview flow.", details: error.message });
   }
 });
 

@@ -15,6 +15,10 @@ const CandidateSchema = new mongoose.Schema({
   atsMatchScore: { type: Number, default: null }, // From your Python Model
   interviewScore: { type: Number, default: null }, // From Gemini API
   
+  // 2-Call Architecture: Pre-generation columns
+  preGeneratedQuestions: { type: [String], default: [] },
+  currentQuestionIndex: { type: Number, default: 0 },
+  
   // The entire conversation history saved as an array of objects
   interviewTranscript: [
     {
