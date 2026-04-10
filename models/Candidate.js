@@ -14,6 +14,18 @@ const CandidateSchema = new mongoose.Schema({
   // The AI Scores (Will be filled in later)
   atsMatchScore: { type: Number, default: null }, // From your Python Model
   interviewScore: { type: Number, default: null }, // From Gemini API
+  evaluationStatus: { type: String, enum: ['pending', 'complete'], default: null }, // Tracks async eval state
+
+  // Rich evaluation report (populated by final Gemini call)
+  questionFeedback: [{
+    question: String,
+    candidateAnswer: String,
+    feedback: String
+  }],
+  overallSummary:      { type: String, default: null },
+  strengths:           { type: [String], default: [] },
+  weaknesses:          { type: [String], default: [] },
+  finalRecommendation: { type: String, default: null },
   
   // 2-Call Architecture: Pre-generation columns
   preGeneratedQuestions: { type: [String], default: [] },

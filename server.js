@@ -266,6 +266,39 @@ app.post('/api/interview/chat', async (req, res) => {
     }
     
     const shortResume = candidate.resumeText ? candidate.resumeText.substring(0, 1000) : "";
+
+    // ==========================================
+    // STAGE 0: Save Transcript to Database
+    // ==========================================
+    if (candidateMessage && candidateMessage.trim() !== "") {
+      let previousQuestion = "";
+      // If we haven't generated yet, they just answered the intro sequence
+      if (!candidate.preGeneratedQuestions || candidate.preGeneratedQuestions.length === 0) {
+        previousQuestion = "Can you briefly introduce your background?";
+      } else {
+        // They are answering the question we previously served
+        if (candidate.currentQuestionIndex > 0) {
+          previousQuestion = candidate.preGeneratedQuestions[candidate.currentQuestionIndex - 1];
+        } else {
+          // Edge case fallback
+          previousQuestion = candidate.preGeneratedQuestions[0];
+        }
+      }
+
+      // Check for duplication (don't save if they accidentally double-submit the identical answer)
+      const isDuplicate = candidate.interviewTranscript.length > 0 && 
+        candidate.interviewTranscript[candidate.interviewTranscript.length - 1].candidateAnswer === candidateMessage;
+      
+      if (!isDuplicate) {
+        candidate.interviewTranscript.push({
+          question: previousQuestion,
+          candidateAnswer: candidateMessage,
+          aiRating: null,
+          aiFeedback: null
+        });
+        await candidate.save();
+      }
+    }
     
     // ==========================================
     // STAGE 1: Pre-Generate Questions (Call 1)
@@ -330,6 +363,10 @@ ${shortResume}`;
     if (isDone) {
       aiResponseText = "This concludes the technical portion of our interview. Thank you for your time, the HR team will review your responses and explicitly reach out to you shortly.";
       
+      // Mark evaluation as pending BEFORE firing background task (synchronous, so frontend can poll)
+      candidate.evaluationStatus = 'pending';
+      await candidate.save();
+
       // ==========================================
       // STAGE 3: Final Background Evaluation (Call 2)
       // ==========================================
@@ -337,17 +374,36 @@ ${shortResume}`;
         try {
           console.log(`\n[BACKGROUND] Initiating Evaluation for ${candidate.name}...`);
           
-          const transcript = chatHistory.map(m => `${m.role}: ${m.content}`).join("\n") + `\nuser: ${candidateMessage}\nmodel: ${aiResponseText}`;
-          const evalPrompt = `Evaluate this technical interview transcript for candidate ${candidate.name} based on their resume.
-Resume: ${shortResume}
+          // Re-fetch candidate to ensure we have the absolute final transcript array saved
+          const finalCandidateData = await Candidate.findById(candidate._id);
+          const transcriptText = finalCandidateData.interviewTranscript.map((entry, idx) => 
+            `[Q${idx + 1}] Interviewer: ${entry.question}\n[A${idx + 1}] Candidate: ${entry.candidateAnswer}`
+          ).join("\n\n");
 
-Transcript:
-${transcript}
+          const evalPrompt = `You are an expert technical interviewer. Evaluate the following interview transcript for candidate: ${finalCandidateData.name}.
 
-Calculate a final interview score from 0 to 100 assessing their technical accuracy and communication. 
-Return ONLY a JSON object matching this exact schema:
-{"score": 85, "feedback": "Brief feedback"}`;
-          
+Resume Summary:
+${shortResume}
+
+Full Interview Transcript:
+${transcriptText}
+
+Your task is to provide a comprehensive evaluation. Return ONLY a valid JSON object with EXACTLY this schema and no other text:
+{
+  "score": 85,
+  "questionFeedback": [
+    {
+      "question": "Exact question text",
+      "candidateAnswer": "Candidate's answer text",
+      "feedback": "Specific, constructive feedback for this answer in 2-3 sentences"
+    }
+  ],
+  "overallSummary": "A 3-4 sentence paragraph summarizing the candidate's overall performance, technical depth, and communication style.",
+  "strengths": ["Specific strength 1", "Specific strength 2", "Specific strength 3"],
+  "weaknesses": ["Specific area for improvement 1", "Specific area for improvement 2"],
+  "finalRecommendation": "A concise recruiter-style hiring recommendation of 2-3 sentences."
+}`;
+
           const evalModels = [
             { model: "gemini-2.5-pro" },
             { model: "gemini-2.5-flash" },
@@ -362,25 +418,57 @@ Return ONLY a JSON object matching this exact schema:
               });
               
               const jsonMatch = evalText.match(/\{[\s\S]*\}/);
-              let finalScore = 75; 
+              
+              // Safe fallback defaults
+              let finalScore = 70;
+              let finalQuestionFeedback = [];
+              let finalOverallSummary = "The interview has been evaluated.";
+              let finalStrengths = [];
+              let finalWeaknesses = [];
+              let finalRecommendation = "Please review the interview transcript for further details.";
+
               if (jsonMatch) {
-                const evalObj = JSON.parse(jsonMatch[0]);
-                finalScore = evalObj.score;
+                try {
+                  const evalObj = JSON.parse(jsonMatch[0]);
+                  finalScore              = evalObj.score              ?? finalScore;
+                  finalQuestionFeedback  = evalObj.questionFeedback   ?? finalQuestionFeedback;
+                  finalOverallSummary    = evalObj.overallSummary     ?? finalOverallSummary;
+                  finalStrengths         = evalObj.strengths          ?? finalStrengths;
+                  finalWeaknesses        = evalObj.weaknesses         ?? finalWeaknesses;
+                  finalRecommendation    = evalObj.finalRecommendation ?? finalRecommendation;
+                } catch (parseErr) {
+                  console.error("[BACKGROUND] JSON parse failed, using fallback values.", parseErr.message);
+                }
               }
 
-              candidate.interviewScore = finalScore;
-              await candidate.save();
-              console.log(`[BACKGROUND] Evaluation completed successfully. Score: ${finalScore}`);
+              // Persist all fields atomically
+              await Candidate.findByIdAndUpdate(candidate._id, {
+                interviewScore:      finalScore,
+                questionFeedback:    finalQuestionFeedback,
+                overallSummary:      finalOverallSummary,
+                strengths:           finalStrengths,
+                weaknesses:          finalWeaknesses,
+                finalRecommendation: finalRecommendation,
+                evaluationStatus:    'complete'
+              });
+              console.log(`[BACKGROUND] ✅ Full evaluation complete. Score: ${finalScore}`);
           }).catch(async (evalErr) => {
               console.error("[BACKGROUND] Evaluation queue failed: ", evalErr.message);
-              candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
-              await candidate.save();
+              await Candidate.findByIdAndUpdate(candidate._id, {
+                interviewScore:      70,
+                overallSummary:      "Evaluation could not be completed at this time.",
+                finalRecommendation: "Please review the transcript manually.",
+                evaluationStatus:    'complete'
+              });
           });
 
         } catch (evalErr) {
           console.error("[BACKGROUND] Evaluation wrapper failed: ", evalErr.message);
-          candidate.interviewScore = Math.floor(Math.random() * 20) + 75;
-          await candidate.save();
+          await Candidate.findByIdAndUpdate(candidate._id, {
+            interviewScore: 70,
+            evaluationFeedback: "Evaluation could not be completed at this time.",
+            evaluationStatus: 'complete'
+          });
         }
       }, 100);
 
@@ -410,8 +498,42 @@ Return ONLY a JSON object matching this exact schema:
 });
 
 // ==========================================
-// START SERVER
+// INTERVIEW SCORE POLLING ENDPOINT
 // ==========================================
+app.get('/api/interview/score/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const candidate = await Candidate.findOne({ interviewToken: token });
+
+    if (!candidate) {
+      return res.status(404).json({ error: "Candidate not found." });
+    }
+
+    if (candidate.evaluationStatus === 'complete') {
+      return res.status(200).json({
+        status:              'complete',
+        score:               candidate.interviewScore,
+        feedback:            candidate.overallSummary || "Interview evaluated successfully.", // backward compat key
+        questionFeedback:    candidate.questionFeedback    || [],
+        overallSummary:      candidate.overallSummary      || "Interview evaluated successfully.",
+        strengths:           candidate.strengths           || [],
+        weaknesses:          candidate.weaknesses          || [],
+        finalRecommendation: candidate.finalRecommendation || ""
+      });
+    }
+
+    // Still running (pending or not started)
+    return res.status(200).json({ status: 'pending' });
+
+  } catch (error) {
+    console.error("Score poll error:", error.message);
+    res.status(500).json({ error: "Failed to fetch score." });
+  }
+});
+
+// ==========================================
+// START SERVER
+// ===========================================
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
   console.log(`AI Screener Backend running on port ${PORT}`);
