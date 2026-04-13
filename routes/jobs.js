@@ -146,5 +146,26 @@ router.delete('/:jobId', verifyToken, async (req, res) => {
     res.status(500).json({ error: "Failed to delete job." });
   }
 });
+// DELETE /api/jobs/:jobId/candidates/:candidateId — Remove a candidate record
+router.delete('/:jobId/candidates/:candidateId', verifyToken, async (req, res) => {
+  try {
+    const { jobId, candidateId } = req.params;
+
+    // Confirm the candidate actually belongs to this job (prevent cross-job deletion)
+    const candidate = await Candidate.findOne({ _id: candidateId, appliedJobId: jobId });
+    if (!candidate) {
+      return res.status(404).json({ error: "Candidate not found for this job." });
+    }
+
+    await Candidate.findByIdAndDelete(candidateId);
+    console.log(`[DB DELETE] Candidate '${candidate.name}' (${candidateId}) deleted by admin ${req.admin.adminId}`);
+
+    res.status(200).json({ message: "Candidate successfully deleted.", candidateId });
+  } catch (error) {
+    console.error("[DB DELETE] Error deleting candidate:", error.message);
+    res.status(500).json({ error: "Failed to delete candidate." });
+  }
+});
+
 // IMPORTANT: You must export the router so server.js can read it!
 module.exports = router;

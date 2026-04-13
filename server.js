@@ -191,6 +191,28 @@ app.get('/api/interview/verify/:token', async (req, res) => {
       return res.status(404).json({ isValid: false, message: "Invalid or expired token." });
     }
 
+    // ==========================================
+    // RESET INTERVIEW SESSION STATE
+    // Ensures every page load starts with a clean slate.
+    // Prevents old Q&A data from corrupting a new session.
+    // ==========================================
+    await Candidate.findByIdAndUpdate(candidate._id, {
+      $set: {
+        preGeneratedQuestions: [],
+        currentQuestionIndex:  0,
+        interviewTranscript:   [],
+        interviewScore:        null,
+        evaluationStatus:      null,
+        questionFeedback:      [],
+        overallSummary:        null,
+        strengths:             [],
+        weaknesses:            [],
+        finalRecommendation:   null,
+        proctoringEvents:      []
+      }
+    });
+    console.log(`[DB RESET] Session reset for candidate: ${candidate.name} (${candidate._id})`);
+
     res.status(200).json({ 
       isValid: true, 
       candidateName: candidate.name 
@@ -206,7 +228,87 @@ app.get('/api/interview/verify/:token', async (req, res) => {
 // INTERVIEW GEMINI AI CHAT ROUTE (FIXED)
 // ==========================================
 
+app.post('/api/interview/proctoring/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const candidate = await Candidate.findOne({ interviewToken: token }).select('_id name');
+
+    if (!candidate) {
+      return res.status(404).json({ error: 'Candidate not found. Invalid token.' });
+    }
+
+    const rawEvents = Array.isArray(req.body.events) ? req.body.events : [req.body];
+    const events = rawEvents
+      .map(normalizeProctoringEvent)
+      .filter(Boolean)
+      .slice(0, 25);
+
+    if (events.length === 0) {
+      return res.status(400).json({ error: 'At least one valid proctoring event is required.' });
+    }
+
+    await Candidate.findByIdAndUpdate(candidate._id, {
+      $push: {
+        proctoringEvents: {
+          $each: events,
+          $slice: -200
+        }
+      }
+    });
+
+    console.log(`[DB WRITE] Saved ${events.length} proctoring event(s) for ${candidate.name}`);
+
+    res.status(201).json({
+      success: true,
+      recorded: events.length
+    });
+  } catch (error) {
+    console.error('Proctoring ingestion error:', error.message);
+    res.status(500).json({ error: 'Failed to record proctoring events.' });
+  }
+});
+
 const responseCache = new Map(); // Global in-memory cache for repeated answers
+
+const PROCTORING_EVENT_SEVERITY = {
+  TAB_SWITCH: 'critical',
+  WINDOW_BLUR: 'warning',
+  MULTIPLE_FACES: 'critical',
+  NO_FACE: 'critical',
+  LOOKING_AWAY: 'warning',
+  TOO_FAR: 'warning',
+  TOO_CLOSE: 'info',
+  WINDOW_FOCUS: 'info',
+  ANALYSIS_ERROR: 'warning'
+};
+
+function normalizeProctoringEvent(rawEvent = {}) {
+  const eventType = String(rawEvent.eventType || rawEvent.event || '').trim().toUpperCase();
+
+  if (!eventType) {
+    return null;
+  }
+
+  const parsedTimestamp =
+    typeof rawEvent.timestamp === 'number'
+      ? new Date(rawEvent.timestamp)
+      : rawEvent.timestamp
+        ? new Date(rawEvent.timestamp)
+        : new Date();
+
+  return {
+    eventType,
+    severity: PROCTORING_EVENT_SEVERITY[eventType] || rawEvent.severity || 'info',
+    message: rawEvent.message || null,
+    timestamp: Number.isNaN(parsedTimestamp.getTime()) ? new Date() : parsedTimestamp,
+    details:
+      rawEvent.details && typeof rawEvent.details === 'object' && !Array.isArray(rawEvent.details)
+        ? rawEvent.details
+        : rawEvent.metadata && typeof rawEvent.metadata === 'object' && !Array.isArray(rawEvent.metadata)
+          ? rawEvent.metadata
+          : {}
+  };
+}
 
 async function callGeminiWithModelFallback({ modelOptionsArray, chatOptions, prompt }) {
   let lastError;
@@ -272,7 +374,7 @@ app.post('/api/interview/chat', async (req, res) => {
     // ==========================================
     if (candidateMessage && candidateMessage.trim() !== "") {
       let previousQuestion = "";
-      // If we haven't generated yet, they just answered the intro sequence
+      // If we haven't generated yet, they just answered the intro question
       if (!candidate.preGeneratedQuestions || candidate.preGeneratedQuestions.length === 0) {
         previousQuestion = "Can you briefly introduce your background?";
       } else {
@@ -280,23 +382,32 @@ app.post('/api/interview/chat', async (req, res) => {
         if (candidate.currentQuestionIndex > 0) {
           previousQuestion = candidate.preGeneratedQuestions[candidate.currentQuestionIndex - 1];
         } else {
-          // Edge case fallback
           previousQuestion = candidate.preGeneratedQuestions[0];
         }
       }
 
-      // Check for duplication (don't save if they accidentally double-submit the identical answer)
-      const isDuplicate = candidate.interviewTranscript.length > 0 && 
+      // Check for duplication (best-effort: uses in-memory snapshot fetched at request start)
+      const isDuplicate = candidate.interviewTranscript.length > 0 &&
         candidate.interviewTranscript[candidate.interviewTranscript.length - 1].candidateAnswer === candidateMessage;
-      
+
       if (!isDuplicate) {
-        candidate.interviewTranscript.push({
+        const transcriptEntry = {
           question: previousQuestion,
           candidateAnswer: candidateMessage,
           aiRating: null,
           aiFeedback: null
-        });
-        await candidate.save();
+        };
+        // ATOMIC $push — safe against concurrent saves overwriting the array
+        await Candidate.findByIdAndUpdate(
+          candidate._id,
+          { $push: { interviewTranscript: transcriptEntry } },
+          { new: false }
+        );
+        // Keep in-memory copy in sync so duplicate check works within same request
+        candidate.interviewTranscript.push(transcriptEntry);
+        console.log(`[DB WRITE] Transcript entry saved for ${candidate.name}: "${candidateMessage.substring(0, 60)}..."`);
+      } else {
+        console.log(`[DB SKIP] Duplicate answer detected for ${candidate.name} — skipping transcript save.`);
       }
     }
     
@@ -338,20 +449,28 @@ ${shortResume}`;
         // Fallback if parsing fails
         if (!questions || questions.length < 5) throw new Error("JSON generation failed");
         
-        candidate.preGeneratedQuestions = questions;
+        candidate.preGeneratedQuestions = questions; // keep in-memory for STAGE 2
       } catch (err) {
         console.error("Failed to generate questions:", err.message);
         candidate.preGeneratedQuestions = [
-          "Can you describe your technical background?", 
-          "What is the most complex bug you've recently solved?", 
-          "How do you ensure code quality in your projects?", 
-          "Can you explain a time you had to learn a new technology quickly?", 
+          "Can you describe your technical background?",
+          "What is the most complex bug you've recently solved?",
+          "How do you ensure code quality in your projects?",
+          "Can you explain a time you had to learn a new technology quickly?",
           "Where do you see your technical skills growing in the next year?"
         ];
       }
-      
-      candidate.currentQuestionIndex = 0;
-      await candidate.save();
+
+      candidate.currentQuestionIndex = 0; // keep in-memory for STAGE 2
+
+      // ATOMIC $set — avoids overwriting transcript that was just $push'd above
+      await Candidate.findByIdAndUpdate(candidate._id, {
+        $set: {
+          preGeneratedQuestions: candidate.preGeneratedQuestions,
+          currentQuestionIndex: 0
+        }
+      });
+      console.log(`[DB WRITE] ${candidate.preGeneratedQuestions.length} questions saved for ${candidate.name}, index reset to 0`);
     }
 
     // ==========================================
@@ -363,9 +482,11 @@ ${shortResume}`;
     if (isDone) {
       aiResponseText = "This concludes the technical portion of our interview. Thank you for your time, the HR team will review your responses and explicitly reach out to you shortly.";
       
-      // Mark evaluation as pending BEFORE firing background task (synchronous, so frontend can poll)
-      candidate.evaluationStatus = 'pending';
-      await candidate.save();
+      // Mark evaluation as pending BEFORE firing background task (atomic — does not touch transcript)
+      await Candidate.findByIdAndUpdate(candidate._id, {
+        $set: { evaluationStatus: 'pending' }
+      });
+      console.log(`[DB WRITE] evaluationStatus set to 'pending' for ${candidate.name}`);
 
       // ==========================================
       // STAGE 3: Final Background Evaluation (Call 2)
@@ -464,19 +585,27 @@ Your task is to provide a comprehensive evaluation. Return ONLY a valid JSON obj
 
         } catch (evalErr) {
           console.error("[BACKGROUND] Evaluation wrapper failed: ", evalErr.message);
+          // BUG FIX: evaluationFeedback no longer exists — use overallSummary
           await Candidate.findByIdAndUpdate(candidate._id, {
-            interviewScore: 70,
-            evaluationFeedback: "Evaluation could not be completed at this time.",
-            evaluationStatus: 'complete'
+            $set: {
+              interviewScore:      70,
+              overallSummary:      "Evaluation could not be completed at this time.",
+              finalRecommendation: "Please review the transcript manually.",
+              evaluationStatus:    'complete'
+            }
           });
+          console.log(`[DB WRITE] Fallback evaluation saved for ${candidate.name} (outer catch).`);
         }
       }, 100);
 
     } else {
-      console.log(`✅ Served question ${candidate.currentQuestionIndex + 1} from MongoDB Cache instantly!`);
       aiResponseText = candidate.preGeneratedQuestions[candidate.currentQuestionIndex];
-      candidate.currentQuestionIndex += 1;
-      await candidate.save();
+      const nextIndex = candidate.currentQuestionIndex + 1;
+      // ATOMIC $inc — prevents double-increment if two requests race
+      await Candidate.findByIdAndUpdate(candidate._id, {
+        $inc: { currentQuestionIndex: 1 }
+      });
+      console.log(`[DB WRITE] Question index incremented to ${nextIndex} for ${candidate.name} — served Q${nextIndex}`);
     }
 
     if (isDone) {
@@ -538,5 +667,3 @@ const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
   console.log(`AI Screener Backend running on port ${PORT}`);
 });
-
-

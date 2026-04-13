@@ -40,6 +40,20 @@ const CandidateSchema = new mongoose.Schema({
       aiFeedback: String
     }
   ],
+
+  proctoringEvents: [
+    {
+      eventType: { type: String, required: true },
+      severity: {
+        type: String,
+        enum: ['info', 'warning', 'critical'],
+        default: 'info'
+      },
+      message: { type: String, default: null },
+      timestamp: { type: Date, default: Date.now },
+      details: { type: mongoose.Schema.Types.Mixed, default: {} }
+    }
+  ],
   
   status: { 
     type: String, 
